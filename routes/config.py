@@ -27,6 +27,15 @@ DB_CONFIG = {
 API_PORT = int(os.getenv("API_PORT", 8000))
 DEBUG = os.getenv("DEBUG", "False").lower() == "true"
 
+# LLM Configuration (optional — AI features degrade gracefully without it)
+LLM_CONFIG = {
+    "provider": os.getenv("LLM_PROVIDER", "gemini"),
+    "api_key": os.getenv("LLM_API_KEY"),
+    "model": os.getenv("LLM_MODEL", "gemini-2.0-flash"),
+    "temperature": float(os.getenv("LLM_TEMPERATURE", "0.1")),
+    "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "4096")),
+}
+
 # Validation: Ensure critical configs are set
 def validate_config():
     """Validate that all required environment variables are set"""

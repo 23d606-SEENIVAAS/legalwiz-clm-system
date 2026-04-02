@@ -372,6 +372,17 @@ async def switch_clause_variant(contract_id: str, request: SwitchVariantRequest)
                 )
             
             conn.commit()
+            
+            # Auto-version: snapshot after variant switch
+            try:
+                from version_routes import create_version_snapshot
+                create_version_snapshot(
+                    contract_id,
+                    f"Switched {request.clause_type} to {request.new_variant} variant"
+                )
+            except Exception:
+                pass  # Don't fail the main operation if versioning fails
+            
             return result
     
     except HTTPException:
