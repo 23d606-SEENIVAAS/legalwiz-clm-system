@@ -9,23 +9,6 @@ from psycopg2.extras import RealDictCursor
 import json
 from config import DB_CONFIG, NEO4J_CONFIG
 
-# # Database configs
-# DB_CONFIG = {
-#     "host": "db.wjbijphzxqizbbgpbacg.supabase.co",
-#     "port": 5432,
-#     "dbname": "postgres",
-#     "user": "postgres",
-#     "password": "Sapvoyagers@1234",
-#     "sslmode": "require"
-# }
-
-# NEO4J_CONFIG = {
-#     "uri": "neo4j+s://3c5b6f0d.databases.neo4j.io",
-#     "username": "neo4j",
-#     "password": "CgG5iYCxef1ExRTXTenDiO6wtXzQPgiDECdWDdmJi38",
-#     "database": "neo4j"
-# }
-
 router = APIRouter(prefix="/api/contracts", tags=["parameters"])
 
 # ==================== PYDANTIC MODELS ====================
@@ -70,16 +53,13 @@ class ContractParameterResponse(BaseModel):
     updated_at: datetime
 
 # ==================== DATABASE HELPERS ====================
+from config import get_connection, get_neo4j_driver
 
 def get_db():
+    """Legacy shim — callers should migrate to get_connection() context manager."""
+    import psycopg2
+    from config import DB_CONFIG
     return psycopg2.connect(**DB_CONFIG)
-
-def get_neo4j_driver():
-    return GraphDatabase.driver(
-        NEO4J_CONFIG["uri"],
-        auth=(NEO4J_CONFIG["username"], NEO4J_CONFIG["password"]),
-        database=NEO4J_CONFIG["database"]
-    )
 
 # ==================== NEO4J QUERIES ====================
 
@@ -124,22 +104,19 @@ def fetch_parameters_for_active_clauses(contract_id: str) -> List[Dict]:
       p.name
     """
     
-    try:
-        with driver.session() as session:
-            result = session.run(cypher_query, {"clause_ids": clause_ids})
-            parameters = []
-            for record in result:
-                parameters.append({
-                    "id": record["id"],
-                    "name": record["name"],
-                    "data_type": record["data_type"],
-                    "is_required": record["is_required"],
-                    "created_at": str(record["created_at"]) if record["created_at"] else None,
-                    "used_in_clauses": list(record["used_in_clauses"])
-                })
-            return parameters
-    finally:
-        driver.close()
+    with driver.session() as session:
+        result = session.run(cypher_query, {"clause_ids": clause_ids})
+        parameters = []
+        for record in result:
+            parameters.append({
+                "id": record["id"],
+                "name": record["name"],
+                "data_type": record["data_type"],
+                "is_required": record["is_required"],
+                "created_at": str(record["created_at"]) if record["created_at"] else None,
+                "used_in_clauses": list(record["used_in_clauses"])
+            })
+        return parameters
 
 # ==================== VALUE CONVERSION HELPER ====================
 
@@ -425,23 +402,20 @@ async def set_parameter_value(contract_id: str, request: ParameterValue, provide
     
     # Get parameter data_type from Neo4j
     driver = get_neo4j_driver()
-    try:
-        with driver.session() as session:
-            result = session.run("""
-                MATCH (p:Parameter {id: $parameter_id})
-                RETURN p.data_type AS data_type
-            """, {"parameter_id": request.parameter_id})
-            
-            param_def = result.single()
-            if not param_def:
-                raise HTTPException(
-                    status_code=404, 
-                    detail=f"Parameter '{request.parameter_id}' not found in Neo4j"
-                )
-            
-            data_type = param_def["data_type"]
-    finally:
-        driver.close()
+    with driver.session() as session:
+        result = session.run("""
+            MATCH (p:Parameter {id: $parameter_id})
+            RETURN p.data_type AS data_type
+        """, {"parameter_id": request.parameter_id})
+        
+        param_def = result.single()
+        if not param_def:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Parameter '{request.parameter_id}' not found in Neo4j"
+            )
+        
+        data_type = param_def["data_type"]
     
     # Convert value to appropriate columns
     value_text, value_integer, value_decimal, value_date, value_currency = convert_parameter_value(
@@ -504,19 +478,16 @@ async def set_parameters_bulk(contract_id: str, request: BulkSetParametersReques
     
     # Get all parameter data_types from Neo4j
     driver = get_neo4j_driver()
-    try:
-        param_ids = [p.parameter_id for p in request.parameters]
+    param_ids = [p.parameter_id for p in request.parameters]
+    
+    with driver.session() as session:
+        result = session.run("""
+            MATCH (p:Parameter)
+            WHERE p.id IN $param_ids
+            RETURN p.id AS id, p.data_type AS data_type
+        """, {"param_ids": param_ids})
         
-        with driver.session() as session:
-            result = session.run("""
-                MATCH (p:Parameter)
-                WHERE p.id IN $param_ids
-                RETURN p.id AS id, p.data_type AS data_type
-            """, {"param_ids": param_ids})
-            
-            param_types = {rec["id"]: rec["data_type"] for rec in result}
-    finally:
-        driver.close()
+        param_types = {rec["id"]: rec["data_type"] for rec in result}
     
     # Insert/update all parameters
     conn = get_db()

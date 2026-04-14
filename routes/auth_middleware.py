@@ -18,31 +18,34 @@ Set AUTH_REQUIRED=false in .env to bypass auth during development.
 """
 
 import os
-from datetime import datetime, timedelta
+import logging
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
 
-from config import DB_CONFIG
+from config import get_db, DB_CONFIG
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
 
 # ==================== CONFIG ====================
 
+logger = logging.getLogger("legalwiz.auth")
+
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "legalwiz-dev-secret-change-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_EXPIRE_MINUTES", "60"))
 REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("JWT_REFRESH_EXPIRE_DAYS", "7"))
-AUTH_REQUIRED = os.getenv("AUTH_REQUIRED", "false").lower() == "true"
+AUTH_REQUIRED = os.getenv("AUTH_REQUIRED", "true").lower() == "true"
 
-# Mock user for when auth is disabled
+# Mock user for when auth is disabled (⚠ role is "user", NOT "admin")
 MOCK_USER = {
     "id": "11111111-1111-1111-1111-111111111111",
     "email": "dev@legalwiz.local",
     "full_name": "Dev User",
-    "role": "admin",
+    "role": "user",
 }
 
 security = HTTPBearer(auto_error=False)
@@ -53,16 +56,21 @@ security = HTTPBearer(auto_error=False)
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     """Create a JWT access token."""
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire, "type": "access"})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
 def create_refresh_token(data: dict) -> str:
-    """Create a JWT refresh token (longer lived)."""
+    """Create a JWT refresh token (longer lived) with a unique jti for revocation."""
+    import uuid as _uuid
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    to_encode.update({"exp": expire, "type": "refresh"})
+    expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.update({
+        "exp": expire,
+        "type": "refresh",
+        "jti": str(_uuid.uuid4()),
+    })
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
@@ -72,9 +80,10 @@ def decode_token(token: str) -> Dict[str, Any]:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         return payload
     except JWTError as e:
+        logger.warning(f"JWT decode failure: {type(e).__name__}: {e}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid token: {str(e)}",
+            detail="Invalid or expired token",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -116,7 +125,7 @@ async def get_current_user(
         )
 
     # Look up user in DB
-    conn = psycopg2.connect(**DB_CONFIG)
+    conn = get_db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""

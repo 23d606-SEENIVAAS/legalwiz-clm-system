@@ -18,7 +18,8 @@ import uuid
 
 from passlib.context import CryptContext
 
-from config import DB_CONFIG
+from config import get_db, DB_CONFIG
+from auth_middleware import ACCESS_TOKEN_EXPIRE_MINUTES
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -27,6 +28,7 @@ from auth_middleware import (
     create_refresh_token,
     decode_token,
     get_current_user,
+    REFRESH_TOKEN_EXPIRE_DAYS,
 )
 
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
@@ -35,15 +37,11 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # ==================== TABLE AUTO-CREATION ====================
 
-_table_created = False
 
 def _ensure_table():
-    """Create users table if it doesn't exist."""
-    global _table_created
-    if _table_created:
-        return
+    """Create users + revoked_tokens tables if they don't exist. Called once at startup."""
 
-    conn = psycopg2.connect(**DB_CONFIG)
+    conn = get_db()
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -62,8 +60,19 @@ def _ensure_table():
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)
             """)
+            # Revoked tokens table (for refresh token invalidation)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS revoked_tokens (
+                    jti TEXT PRIMARY KEY,
+                    revoked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    expires_at TIMESTAMPTZ NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_revoked_tokens_expires
+                ON revoked_tokens(expires_at)
+            """)
             conn.commit()
-        _table_created = True
     finally:
         conn.close()
 
@@ -71,10 +80,10 @@ def _ensure_table():
 # ==================== PYDANTIC MODELS ====================
 
 class RegisterRequest(BaseModel):
-    email: str = Field(..., min_length=5, max_length=255, description="User email")
+    email: EmailStr = Field(..., description="User email")
     password: str = Field(..., min_length=8, max_length=128, description="Min 8 characters")
     full_name: str = Field(..., min_length=2, max_length=100)
-    role: str = Field(default="user", pattern="^(admin|user|viewer)$")
+    # Role is always 'user' on self-registration. Admin promotion is a separate operation.
 
 
 class LoginRequest(BaseModel):
@@ -105,8 +114,6 @@ class UserProfile(BaseModel):
 
 # ==================== HELPERS ====================
 
-def get_db():
-    return psycopg2.connect(**DB_CONFIG)
 
 
 # ==================== ROUTES ====================
@@ -117,7 +124,6 @@ async def register(request: RegisterRequest):
     Create a new user account.
     Returns access + refresh tokens on success.
     """
-    _ensure_table()
 
     conn = get_db()
     try:
@@ -139,7 +145,7 @@ async def register(request: RegisterRequest):
                 INSERT INTO users (id, email, password_hash, full_name, role)
                 VALUES (%s, %s, %s, %s, %s)
                 RETURNING id, email, full_name, role, is_active, created_at
-            """, (user_id, request.email.lower(), password_hash, request.full_name, request.role))
+            """, (user_id, request.email.lower(), password_hash, request.full_name, "user"))
 
             user = cur.fetchone()
             conn.commit()
@@ -153,7 +159,7 @@ async def register(request: RegisterRequest):
             "access_token": access_token,
             "refresh_token": refresh_token,
             "token_type": "bearer",
-            "expires_in": 3600,
+            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
             "user": {
                 "id": str(user["id"]),
                 "email": user["email"],
@@ -171,7 +177,6 @@ async def login(request: LoginRequest):
     Authenticate with email + password.
     Returns access + refresh tokens.
     """
-    _ensure_table()
 
     conn = get_db()
     try:
@@ -212,7 +217,7 @@ async def login(request: LoginRequest):
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
-        "expires_in": 3600,
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         "user": {
             "id": str(user["id"]),
             "email": user["email"],
@@ -225,7 +230,7 @@ async def login(request: LoginRequest):
 @router.get("/me", response_model=UserProfile)
 async def get_profile(user=Depends(get_current_user)):
     """Get current user's profile. Requires authentication."""
-    _ensure_table()
+
 
     # In dev mode, return mock user
     if user.get("email") == "dev@legalwiz.local":
@@ -274,6 +279,22 @@ async def refresh_token(request: RefreshRequest):
     conn = get_db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Check if this refresh token has been revoked
+            jti = payload.get("jti")
+            if not jti:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid refresh token (missing jti)"
+                )
+            cur.execute(
+                "SELECT 1 FROM revoked_tokens WHERE jti = %s", (jti,)
+            )
+            if cur.fetchone():
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Refresh token has been revoked"
+                )
+
             cur.execute("""
                 SELECT id, email, full_name, role, is_active
                 FROM users WHERE id = %s
@@ -297,7 +318,7 @@ async def refresh_token(request: RefreshRequest):
         "access_token": new_access,
         "refresh_token": new_refresh,
         "token_type": "bearer",
-        "expires_in": 3600,
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         "user": {
             "id": str(user["id"]),
             "email": user["email"],
@@ -305,3 +326,43 @@ async def refresh_token(request: RefreshRequest):
             "role": user["role"],
         }
     }
+
+
+@router.post("/logout")
+async def logout(request: RefreshRequest):
+    """
+    Revoke a refresh token so it can no longer be used.
+    Call this on user logout to prevent stolen-token replay.
+    """
+
+
+    payload = decode_token(request.refresh_token)
+    if payload.get("type") != "refresh":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide a refresh token"
+        )
+
+    jti = payload.get("jti")
+    if not jti:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid refresh token (missing jti)"
+        )
+    exp = payload.get("exp")
+    from datetime import timezone as tz, timedelta
+    expires_at = datetime.fromtimestamp(exp, tz=tz.utc) if exp else (datetime.now(tz.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS))
+
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO revoked_tokens (jti, expires_at)
+                VALUES (%s, %s)
+                ON CONFLICT (jti) DO NOTHING
+            """, (jti, expires_at))
+            conn.commit()
+    finally:
+        conn.close()
+
+    return {"message": "Token revoked successfully"}

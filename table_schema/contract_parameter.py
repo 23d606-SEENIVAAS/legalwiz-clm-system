@@ -1,3 +1,4 @@
+import os
 import psycopg2
 
 DDL = """
@@ -10,9 +11,7 @@ CREATE TABLE IF NOT EXISTS contract_parameters (
                     REFERENCES contracts(id)
                     ON DELETE CASCADE,
 
-    parameter_id    TEXT NOT NULL
-                    REFERENCES parameter_definitions(parameter_id)
-                    ON DELETE RESTRICT,
+    parameter_id    TEXT NOT NULL,
 
     -- Polymorphic value storage
     value_text      TEXT,
@@ -38,21 +37,30 @@ CREATE INDEX IF NOT EXISTS idx_contract_params_param
     ON contract_parameters(parameter_id);
 """
 
+def _get_db_config():
+    config = {
+        "host": os.getenv("DB_HOST"),
+        "port": int(os.getenv("DB_PORT", "5432")),
+        "dbname": os.getenv("DB_NAME", "postgres"),
+        "user": os.getenv("DB_USER", "postgres"),
+        "password": os.getenv("DB_PASSWORD"),
+        "sslmode": os.getenv("DB_SSLMODE", "require"),
+    }
+    missing = [k for k, v in config.items() if v is None]
+    if missing:
+        raise EnvironmentError(
+            f"Missing required env vars: {', '.join(f'DB_{k.upper()}' for k in missing)}"
+        )
+    return config
+
 def create_schema():
     conn = None
     try:
-        conn = psycopg2.connect(
-            host="db.wjbijphzxqizbbgpbacg.supabase.co",
-            port=5432,
-            dbname="postgres",
-            user="postgres",
-            password="Sapvoyagers@1234",
-            sslmode="require"
-        )
+        conn = psycopg2.connect(**_get_db_config())
         conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute(DDL)
-        print("✅ contract_parameters table created with FK → contracts & parameter_definitions!")
+        print("✅ contract_parameters table created with FK → contracts!")
         print("   🎯 UNIQUE(contract_id, parameter_id) enforced")
     except Exception as e:
         print("❌ Error:", e)

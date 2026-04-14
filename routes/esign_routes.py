@@ -18,16 +18,22 @@ Requires DocuSign developer account credentials in .env:
 import os
 import base64
 import json
+import hmac
+import hashlib
+import logging
 from io import BytesIO
 from datetime import datetime
 from typing import Optional, Dict, Any
 
-from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, Request, Depends
+from pydantic import BaseModel, Field, EmailStr
 
-from config import DB_CONFIG
+from config import get_db, DB_CONFIG, verify_contract_ownership
+from auth_middleware import get_current_user
 import psycopg2
 from psycopg2.extras import RealDictCursor
+
+logger = logging.getLogger("legalwiz.esign")
 
 router = APIRouter(tags=["e-signature"])
 
@@ -178,15 +184,11 @@ def _get_docusign_client():
 
 # ==================== TABLE SETUP ====================
 
-_columns_added = False
 
 def _ensure_columns():
-    """Add e-signature columns to contracts table if they don't exist."""
-    global _columns_added
-    if _columns_added:
-        return
+    """Add e-signature columns to contracts table if they don't exist. Called once at startup."""
 
-    conn = psycopg2.connect(**DB_CONFIG)
+    conn = get_db()
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -197,7 +199,6 @@ def _ensure_columns():
                 ALTER TABLE contracts ADD COLUMN IF NOT EXISTS signer_name TEXT;
             """)
             conn.commit()
-        _columns_added = True
     finally:
         conn.close()
 
@@ -205,7 +206,7 @@ def _ensure_columns():
 # ==================== PYDANTIC MODELS ====================
 
 class SendForSigningRequest(BaseModel):
-    signer_email: str = Field(..., description="Email of the signer")
+    signer_email: EmailStr = Field(..., description="Email of the signer")
     signer_name: str = Field(..., description="Name of the signer")
     email_subject: Optional[str] = Field(None, description="Custom email subject")
     email_body: Optional[str] = Field(None, description="Custom email body")
@@ -222,8 +223,6 @@ class SigningStatusResponse(BaseModel):
 
 # ==================== HELPERS ====================
 
-def get_db():
-    return psycopg2.connect(**DB_CONFIG)
 
 
 def _get_contract_pdf(contract_id: str) -> bytes:
@@ -252,9 +251,6 @@ def _update_signing_status(
             if status:
                 updates.append("signing_status = %s")
                 params.append(status)
-            if envelope_id:
-                updates.append("envelope_id = %s")
-                params.append(envelope_id)
             if signer_email:
                 updates.append("signer_email = %s")
                 params.append(signer_email)
@@ -267,10 +263,16 @@ def _update_signing_status(
 
             updates.append("updated_at = NOW()")
 
+            # Determine WHERE clause — avoid double-appending envelope_id
             if contract_id:
+                # When looking up by contract_id, also SET envelope_id if provided
+                if envelope_id:
+                    updates.insert(0, "envelope_id = %s")
+                    params.insert(0, envelope_id)
                 where = "id = %s"
                 params.append(contract_id)
             elif envelope_id:
+                # Looking up by envelope_id — do NOT also set it (was the bug)
                 where = "envelope_id = %s"
                 params.append(envelope_id)
             else:
@@ -286,7 +288,7 @@ def _update_signing_status(
 # ==================== ROUTES ====================
 
 @router.post("/api/contracts/{contract_id}/esign/send")
-async def send_for_signing(contract_id: str, request: SendForSigningRequest):
+async def send_for_signing(contract_id: str, request: SendForSigningRequest, user=Depends(get_current_user)):
     """
     Create a DocuSign envelope and send the contract for e-signature.
 
@@ -295,7 +297,8 @@ async def send_for_signing(contract_id: str, request: SendForSigningRequest):
     3. Sends to the specified signer via email
     4. Stores the envelope_id in the contracts table
     """
-    _ensure_columns()
+    verify_contract_ownership(contract_id, user["id"])
+
 
     # Check contract exists and isn't already sent
     conn = get_db()
@@ -415,13 +418,14 @@ async def send_for_signing(contract_id: str, request: SendForSigningRequest):
 
 
 @router.get("/api/contracts/{contract_id}/esign/signing-url")
-async def get_signing_url(contract_id: str):
+async def get_signing_url(contract_id: str, user=Depends(get_current_user)):
     """
     Get an embedded signing URL for the signer.
     Use this to open DocuSign signing in an iframe or redirect.
     URL is valid for 5 minutes.
     """
-    _ensure_columns()
+    verify_contract_ownership(contract_id, user["id"])
+
 
     conn = get_db()
     try:
@@ -443,10 +447,10 @@ async def get_signing_url(contract_id: str):
             detail="Contract has not been sent for signing yet. Use POST /esign/send first."
         )
 
-    if contract.get("signing_status") == "signed":
+    if contract.get("signing_status") in ("signed", "declined", "voided"):
         raise HTTPException(
             status_code=409,
-            detail="Contract is already signed"
+            detail=f"Cannot get signing URL — contract status is '{contract['signing_status']}'"
         )
 
     client = _get_docusign_client()
@@ -486,14 +490,15 @@ async def get_signing_url(contract_id: str):
 
 
 @router.get("/api/contracts/{contract_id}/esign/status", response_model=SigningStatusResponse)
-async def get_signing_status(contract_id: str):
+async def get_signing_status(contract_id: str, user=Depends(get_current_user)):
     """
     Get the current e-signature status for a contract.
 
     If DocuSign is configured and an envelope exists, also queries
     DocuSign for the latest status and updates the local DB.
     """
-    _ensure_columns()
+    verify_contract_ownership(contract_id, user["id"])
+
 
     conn = get_db()
     try:
@@ -561,12 +566,30 @@ async def docusign_webhook(request: Request):
 
     Webhook URL: https://your-domain.com/api/esign/webhook
     """
+    # --- HMAC signature verification (mandatory) ---
+    hmac_key = os.getenv("DOCUSIGN_HMAC_KEY", "")
+    if not hmac_key:
+        logger.error(
+            "DOCUSIGN_HMAC_KEY not configured — rejecting webhook. "
+            "Set it in .env to enable DocuSign webhook processing."
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Webhook signature verification not configured"
+        )
+
+    raw_body = await request.body()
+    sig_header = request.headers.get("X-DocuSign-Signature-1", "")
+    expected = base64.b64encode(
+        hmac.new(hmac_key.encode(), raw_body, hashlib.sha256).digest()
+    ).decode()
+    if not hmac.compare_digest(sig_header, expected):
+        logger.warning("DocuSign webhook HMAC verification failed")
+        raise HTTPException(status_code=403, detail="Invalid webhook signature")
     try:
-        body = await request.json()
+        body = json.loads(raw_body)
     except Exception:
-        # DocuSign may also send XML; handle gracefully
-        body_bytes = await request.body()
-        return {"message": "Received", "format": "non-json", "size": len(body_bytes)}
+        return {"message": "Received", "format": "non-json", "size": len(raw_body)}
 
     # Extract envelope info from DocuSign webhook payload
     envelope_id = body.get("envelopeId") or body.get("envelope_id")

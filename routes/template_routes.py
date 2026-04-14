@@ -17,7 +17,7 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 import json
 
-from config import DB_CONFIG
+from config import get_db, DB_CONFIG
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -26,15 +26,11 @@ router = APIRouter(tags=["templates"])
 
 # ==================== TABLE AUTO-CREATION ====================
 
-_table_created = False
 
 def _ensure_table():
-    """Create contract_templates table if it doesn't exist."""
-    global _table_created
-    if _table_created:
-        return
+    """Create contract_templates table if it doesn't exist. Called once at startup."""
 
-    conn = psycopg2.connect(**DB_CONFIG)
+    conn = get_db()
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -52,7 +48,6 @@ def _ensure_table():
                 )
             """)
             conn.commit()
-        _table_created = True
     finally:
         conn.close()
 
@@ -85,8 +80,6 @@ class TemplateDetailResponse(TemplateResponse):
 
 # ==================== HELPERS ====================
 
-def get_db():
-    return psycopg2.connect(**DB_CONFIG)
 
 
 def _snapshot_contract(contract_id: str) -> dict:
@@ -158,7 +151,7 @@ async def create_template(request: CreateTemplateRequest):
     Create a reusable template from an existing contract's configuration.
     Captures clause selections (which variants are active) and parameter values.
     """
-    _ensure_table()
+
 
     snapshot = _snapshot_contract(request.contract_id)
 
@@ -198,7 +191,7 @@ async def list_templates(
     jurisdiction: Optional[str] = Query(None, description="Filter by jurisdiction"),
 ):
     """List available contract templates, optionally filtered."""
-    _ensure_table()
+
 
     conn = get_db()
     try:
@@ -232,7 +225,7 @@ async def list_templates(
 @router.get("/api/templates/{template_id}", response_model=TemplateDetailResponse)
 async def get_template(template_id: int):
     """Get a single template with full clause and parameter details."""
-    _ensure_table()
+
 
     conn = get_db()
     try:
@@ -254,7 +247,7 @@ async def get_template(template_id: int):
 @router.delete("/api/templates/{template_id}")
 async def delete_template(template_id: int):
     """Delete a template."""
-    _ensure_table()
+
 
     conn = get_db()
     try:
@@ -279,7 +272,7 @@ async def apply_template(contract_id: str, template_id: int):
 
     Only affects clause active/inactive state — does not delete clauses.
     """
-    _ensure_table()
+
 
     conn = get_db()
     try:

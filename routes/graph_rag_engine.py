@@ -13,11 +13,27 @@ import json
 import re
 import os
 from typing import List, Dict, Optional, Any, Tuple
-from neo4j import GraphDatabase
-import psycopg2
 from psycopg2.extras import RealDictCursor
-from config import DB_CONFIG, NEO4J_CONFIG
+from config import get_connection, get_neo4j_driver
 from llm_config import LLM_CONFIG
+
+
+# Module-level Neo4j driver singleton — initialized lazily, reused everywhere
+_driver = None
+
+def _get_shared_driver():
+    """Return the shared Neo4j driver (lazy init, never closed per-call)."""
+    global _driver
+    if _driver is None:
+        _driver = get_neo4j_driver()
+    return _driver
+
+def close_driver():
+    """Close the shared Neo4j driver. Call from app shutdown only."""
+    global _driver
+    if _driver is not None:
+        _driver.close()
+        _driver = None
 
 
 # ============================================================================
@@ -29,28 +45,14 @@ class GraphRAGRetriever:
     """
     Retrieves structured context from the Neo4j knowledge graph.
     Each method returns graph data formatted for LLM prompts.
+    Uses the module-level _driver singleton for all Neo4j operations.
     """
-    
-    def __init__(self):
-        self.neo4j_config = NEO4J_CONFIG
-        self.db_config = DB_CONFIG
-    
-    def _get_driver(self):
-        return GraphDatabase.driver(
-            self.neo4j_config["uri"],
-            auth=(self.neo4j_config["username"], self.neo4j_config["password"]),
-            database=self.neo4j_config.get("database", "neo4j")
-        )
-    
-    def _get_pg(self):
-        return psycopg2.connect(**self.db_config)
-    
+
     # ------ Active Clause Helpers ------
     
     def get_active_clause_ids(self, contract_id: str) -> List[str]:
         """Get list of active clause_ids for a contract from Supabase."""
-        conn = self._get_pg()
-        try:
+        with get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
                     SELECT clause_id, clause_type, variant
@@ -59,21 +61,16 @@ class GraphRAGRetriever:
                     ORDER BY sequence
                 """, (contract_id,))
                 return cur.fetchall()
-        finally:
-            conn.close()
     
     def get_contract_info(self, contract_id: str) -> Optional[Dict]:
         """Get contract metadata from Supabase."""
-        conn = self._get_pg()
-        try:
+        with get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
                     SELECT id, title, contract_type, jurisdiction, status, description
                     FROM contracts WHERE id = %s
                 """, (contract_id,))
                 return cur.fetchone()
-        finally:
-            conn.close()
     
     # ------ RECOMMENDATION CONTEXT ------
     
@@ -86,98 +83,94 @@ class GraphRAGRetriever:
         2. REQUIRES dependencies that might be missing
         3. Optional clause types not yet selected
         """
-        driver = self._get_driver()
+        driver = _get_shared_driver()
         neo4j_ct_id = contract_type.replace("_", "-")
         
-        try:
-            with driver.session() as session:
-                # 1. Get alternatives to current active clauses
-                alternatives = session.run("""
-                    MATCH (active:Clause)-[alt:ALTERNATIVE_TO]->(better:Clause)
-                    WHERE active.id IN $active_ids
-                      AND better.jurisdiction = $jurisdiction
-                      AND NOT better.id IN $active_ids
-                    RETURN 
-                        active.id AS current_clause_id,
-                        active.variant AS current_variant,
-                        active.risk_level AS current_risk,
-                        active.clause_type AS clause_type,
-                        better.id AS recommended_clause_id,
-                        better.variant AS recommended_variant,
-                        better.risk_level AS recommended_risk,
-                        alt.alternative_type AS alternative_type,
-                        alt.reason AS reason,
-                        alt.benefit AS benefit,
-                        alt.recommendation_strength AS strength
-                    ORDER BY alt.recommendation_strength DESC
-                """, {
-                    "active_ids": active_clause_ids,
-                    "jurisdiction": jurisdiction
-                })
-                alternatives_data = [dict(r) for r in alternatives]
-                
-                # 2. Get REQUIRES dependencies and check for gaps
-                requires = session.run("""
-                    MATCH (ct:ContractType {id: $contract_type})
-                          -[:CONTAINS_CLAUSE]->(clauseType:ClauseType)
-                          -[:HAS_VARIANT]->(c:Clause)
-                    WHERE c.id IN $active_ids
-                    WITH DISTINCT clauseType
-                    MATCH (clauseType)-[req:REQUIRES]->(required:ClauseType)
-                    OPTIONAL MATCH (required)-[:HAS_VARIANT]->(reqClause:Clause)
-                    WHERE reqClause.jurisdiction = $jurisdiction
-                    RETURN 
-                        clauseType.id AS source_clause_type,
-                        clauseType.name AS source_name,
-                        required.id AS required_clause_type,
-                        required.name AS required_name,
-                        req.dependency_type AS dependency_type,
-                        req.is_critical AS is_critical,
-                        req.reason AS reason,
-                        collect(reqClause.id) AS available_clause_ids
-                """, {
-                    "contract_type": neo4j_ct_id,
-                    "active_ids": active_clause_ids,
-                    "jurisdiction": jurisdiction
-                })
-                requires_data = []
-                for r in requires:
-                    rec = dict(r)
-                    # Check if any of the required clause type's variants are in active clauses
-                    has_required = any(cid in active_clause_ids for cid in rec["available_clause_ids"])
-                    rec["is_missing"] = not has_required
-                    requires_data.append(rec)
-                
-                # 3. Get optional clause types available but not selected
-                optional_gaps = session.run("""
-                    MATCH (ct:ContractType {id: $contract_type})
-                          -[rel:CONTAINS_CLAUSE]->(clauseType:ClauseType)
-                          -[:HAS_VARIANT]->(c:Clause)
-                    WHERE rel.mandatory = false
-                      AND c.jurisdiction = $jurisdiction
-                      AND NOT c.id IN $active_ids
-                    WITH DISTINCT clauseType, rel
-                    RETURN 
-                        clauseType.id AS clause_type_id,
-                        clauseType.name AS clause_type_name,
-                        clauseType.category AS category,
-                        clauseType.importance_level AS importance_level,
-                        rel.description AS description
-                    ORDER BY clauseType.importance_level DESC
-                """, {
-                    "contract_type": neo4j_ct_id,
-                    "active_ids": active_clause_ids,
-                    "jurisdiction": jurisdiction
-                })
-                optional_data = [dict(r) for r in optional_gaps]
-                
-                return {
-                    "alternatives": alternatives_data,
-                    "requires": [r for r in requires_data if r["is_missing"]],
-                    "optional_gaps": optional_data
-                }
-        finally:
-            driver.close()
+        with driver.session() as session:
+            # 1. Get alternatives to current active clauses
+            alternatives = session.run("""
+                MATCH (active:Clause)-[alt:ALTERNATIVE_TO]->(better:Clause)
+                WHERE active.id IN $active_ids
+                  AND better.jurisdiction = $jurisdiction
+                  AND NOT better.id IN $active_ids
+                RETURN 
+                    active.id AS current_clause_id,
+                    active.variant AS current_variant,
+                    active.risk_level AS current_risk,
+                    active.clause_type AS clause_type,
+                    better.id AS recommended_clause_id,
+                    better.variant AS recommended_variant,
+                    better.risk_level AS recommended_risk,
+                    alt.alternative_type AS alternative_type,
+                    alt.reason AS reason,
+                    alt.benefit AS benefit,
+                    alt.recommendation_strength AS strength
+                ORDER BY alt.recommendation_strength DESC
+            """, {
+                "active_ids": active_clause_ids,
+                "jurisdiction": jurisdiction
+            })
+            alternatives_data = [dict(r) for r in alternatives]
+            
+            # 2. Get REQUIRES dependencies and check for gaps
+            requires = session.run("""
+                MATCH (ct:ContractType {id: $contract_type})
+                      -[:CONTAINS_CLAUSE]->(clauseType:ClauseType)
+                      -[:HAS_VARIANT]->(c:Clause)
+                WHERE c.id IN $active_ids
+                WITH DISTINCT clauseType
+                MATCH (clauseType)-[req:REQUIRES]->(required:ClauseType)
+                OPTIONAL MATCH (required)-[:HAS_VARIANT]->(reqClause:Clause)
+                WHERE reqClause.jurisdiction = $jurisdiction
+                RETURN 
+                    clauseType.id AS source_clause_type,
+                    clauseType.name AS source_name,
+                    required.id AS required_clause_type,
+                    required.name AS required_name,
+                    req.dependency_type AS dependency_type,
+                    req.is_critical AS is_critical,
+                    req.reason AS reason,
+                    collect(reqClause.id) AS available_clause_ids
+            """, {
+                "contract_type": neo4j_ct_id,
+                "active_ids": active_clause_ids,
+                "jurisdiction": jurisdiction
+            })
+            requires_data = []
+            for r in requires:
+                rec = dict(r)
+                has_required = any(cid in active_clause_ids for cid in rec["available_clause_ids"])
+                rec["is_missing"] = not has_required
+                requires_data.append(rec)
+            
+            # 3. Get optional clause types available but not selected
+            optional_gaps = session.run("""
+                MATCH (ct:ContractType {id: $contract_type})
+                      -[rel:CONTAINS_CLAUSE]->(clauseType:ClauseType)
+                      -[:HAS_VARIANT]->(c:Clause)
+                WHERE rel.mandatory = false
+                  AND c.jurisdiction = $jurisdiction
+                  AND NOT c.id IN $active_ids
+                WITH DISTINCT clauseType, rel
+                RETURN 
+                    clauseType.id AS clause_type_id,
+                    clauseType.name AS clause_type_name,
+                    clauseType.category AS category,
+                    clauseType.importance_level AS importance_level,
+                    rel.description AS description
+                ORDER BY clauseType.importance_level DESC
+            """, {
+                "contract_type": neo4j_ct_id,
+                "active_ids": active_clause_ids,
+                "jurisdiction": jurisdiction
+            })
+            optional_data = [dict(r) for r in optional_gaps]
+            
+            return {
+                "alternatives": alternatives_data,
+                "requires": [r for r in requires_data if r["is_missing"]],
+                "optional_gaps": optional_data
+            }
     
     # ------ CUSTOMIZATION CONTEXT ------
     
@@ -188,65 +181,62 @@ class GraphRAGRetriever:
         2. All variant alternatives for this clause type
         3. Parameters used in this clause
         """
-        driver = self._get_driver()
-        try:
-            with driver.session() as session:
-                # 1. Get the target clause + its clause type info
-                clause_result = session.run("""
-                    MATCH (ct:ClauseType)-[:HAS_VARIANT]->(c:Clause {id: $clause_id})
-                    RETURN
-                        c.id AS clause_id,
-                        c.raw_text AS raw_text,
-                        c.variant AS variant,
-                        c.risk_level AS risk_level,
-                        c.jurisdiction AS jurisdiction,
-                        c.clause_type AS clause_type,
-                        ct.id AS clause_type_id,
-                        ct.name AS clause_type_name,
-                        ct.category AS category,
-                        ct.importance_level AS importance_level
-                """, {"clause_id": clause_id})
-                
-                clause_data = clause_result.single()
-                if not clause_data:
-                    return None
-                clause_dict = dict(clause_data)
-                
-                # 2. Get all variants of this clause type
-                variants_result = session.run("""
-                    MATCH (ct:ClauseType {id: $clause_type_id})-[:HAS_VARIANT]->(v:Clause)
-                    WHERE v.jurisdiction = $jurisdiction
-                    RETURN
-                        v.id AS clause_id,
-                        v.variant AS variant,
-                        v.risk_level AS risk_level,
-                        v.raw_text AS raw_text
-                    ORDER BY v.risk_level
-                """, {
-                    "clause_type_id": clause_dict["clause_type_id"],
-                    "jurisdiction": clause_dict["jurisdiction"]
-                })
-                variants = [dict(v) for v in variants_result]
-                
-                # 3. Get parameters for this clause
-                params_result = session.run("""
-                    MATCH (c:Clause {id: $clause_id})-[:CONTAINS_PARAM]->(p:Parameter)
-                    RETURN
-                        p.id AS parameter_id,
-                        p.name AS parameter_name,
-                        p.data_type AS data_type,
-                        p.is_required AS is_required
-                    ORDER BY p.name
-                """, {"clause_id": clause_id})
-                parameters = [dict(p) for p in params_result]
-                
-                return {
-                    "clause": clause_dict,
-                    "all_variants": variants,
-                    "parameters": parameters
-                }
-        finally:
-            driver.close()
+        driver = _get_shared_driver()
+        with driver.session() as session:
+            # 1. Get the target clause + its clause type info
+            clause_result = session.run("""
+                MATCH (ct:ClauseType)-[:HAS_VARIANT]->(c:Clause {id: $clause_id})
+                RETURN
+                    c.id AS clause_id,
+                    c.raw_text AS raw_text,
+                    c.variant AS variant,
+                    c.risk_level AS risk_level,
+                    c.jurisdiction AS jurisdiction,
+                    c.clause_type AS clause_type,
+                    ct.id AS clause_type_id,
+                    ct.name AS clause_type_name,
+                    ct.category AS category,
+                    ct.importance_level AS importance_level
+            """, {"clause_id": clause_id})
+            
+            clause_data = clause_result.single()
+            if not clause_data:
+                return None
+            clause_dict = dict(clause_data)
+            
+            # 2. Get all variants of this clause type
+            variants_result = session.run("""
+                MATCH (ct:ClauseType {id: $clause_type_id})-[:HAS_VARIANT]->(v:Clause)
+                WHERE v.jurisdiction = $jurisdiction
+                RETURN
+                    v.id AS clause_id,
+                    v.variant AS variant,
+                    v.risk_level AS risk_level,
+                    v.raw_text AS raw_text
+                ORDER BY v.risk_level
+            """, {
+                "clause_type_id": clause_dict["clause_type_id"],
+                "jurisdiction": clause_dict["jurisdiction"]
+            })
+            variants = [dict(v) for v in variants_result]
+            
+            # 3. Get parameters for this clause
+            params_result = session.run("""
+                MATCH (c:Clause {id: $clause_id})-[:CONTAINS_PARAM]->(p:Parameter)
+                RETURN
+                    p.id AS parameter_id,
+                    p.name AS parameter_name,
+                    p.data_type AS data_type,
+                    p.is_required AS is_required
+                ORDER BY p.name
+            """, {"clause_id": clause_id})
+            parameters = [dict(p) for p in params_result]
+            
+            return {
+                "clause": clause_dict,
+                "all_variants": variants,
+                "parameters": parameters
+            }
     
     # ------ RISK ANALYSIS CONTEXT ------
     
@@ -260,11 +250,10 @@ class GraphRAGRetriever:
         3. REQUIRES dependencies and missing gaps
         4. Clause types available but not included
         """
-        driver = self._get_driver()
+        driver = _get_shared_driver()
         neo4j_ct_id = contract_type.replace("_", "-")
         
-        try:
-            with driver.session() as session:
+        with driver.session() as session:
                 # 1. Get risk levels + metadata for active clauses
                 clause_risks = session.run("""
                     MATCH (c:Clause)
@@ -366,8 +355,6 @@ class GraphRAGRetriever:
                     "missing_dependencies": missing_dep_data,
                     "gaps": gap_data
                 }
-        finally:
-            driver.close()
     
     # ------ CHATBOT / QA CONTEXT ------
     
@@ -378,91 +365,79 @@ class GraphRAGRetriever:
         Retrieve relevant context for answering a question about the contract.
         Fetches clause texts + parameters for the relevant clauses.
         """
-        driver = self._get_driver()
+        driver = _get_shared_driver()
         
-        try:
-            with driver.session() as session:
-                # Get all active clauses with full text
-                clauses = session.run("""
-                    MATCH (c:Clause)
-                    WHERE c.id IN $active_ids
-                    OPTIONAL MATCH (ct:ClauseType)-[:HAS_VARIANT]->(c)
-                    RETURN
-                        c.id AS clause_id,
-                        c.clause_type AS clause_type,
-                        c.variant AS variant,
-                        c.risk_level AS risk_level,
-                        c.raw_text AS raw_text,
-                        ct.name AS clause_type_name
-                    ORDER BY c.clause_type
-                """, {"active_ids": active_clause_ids})
-                clause_data = [dict(r) for r in clauses]
-                
-                # Get parameter values from Supabase
-                conn = self._get_pg()
-                try:
-                    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                        cur.execute("""
-                            SELECT cp.parameter_id, 
-                                   cp.value_text, cp.value_integer, cp.value_decimal,
-                                   cp.value_date, cp.value_currency
-                            FROM contract_parameters cp
-                            WHERE cp.contract_id = %s
-                        """, (contract_id,))
-                        param_rows = cur.fetchall()
-                finally:
-                    conn.close()
-                
-                # Build param values map
-                param_values = {}
-                for row in param_rows:
-                    pid = row["parameter_id"]
-                    if row["value_text"]:
-                        param_values[pid] = row["value_text"]
-                    elif row["value_integer"] is not None:
-                        param_values[pid] = str(row["value_integer"])
-                    elif row["value_decimal"] is not None:
-                        param_values[pid] = str(row["value_decimal"])
-                    elif row["value_date"]:
-                        param_values[pid] = row["value_date"].isoformat()
-                    elif row["value_currency"]:
-                        param_values[pid] = str(row["value_currency"])
-                
-                return {
-                    "clauses": clause_data,
-                    "parameter_values": param_values
-                }
-        finally:
-            driver.close()
+        with driver.session() as session:
+            # Get all active clauses with full text
+            clauses = session.run("""
+                MATCH (c:Clause)
+                WHERE c.id IN $active_ids
+                OPTIONAL MATCH (ct:ClauseType)-[:HAS_VARIANT]->(c)
+                RETURN
+                    c.id AS clause_id,
+                    c.clause_type AS clause_type,
+                    c.variant AS variant,
+                    c.risk_level AS risk_level,
+                    c.raw_text AS raw_text,
+                    ct.name AS clause_type_name
+                ORDER BY c.clause_type
+            """, {"active_ids": active_clause_ids})
+            clause_data = [dict(r) for r in clauses]
+            
+            # Get parameter values from Supabase
+            with get_connection() as pg_conn:
+                with pg_conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("""
+                        SELECT cp.parameter_id, 
+                               cp.value_text, cp.value_integer, cp.value_decimal,
+                               cp.value_date, cp.value_currency
+                        FROM contract_parameters cp
+                        WHERE cp.contract_id = %s
+                    """, (contract_id,))
+                    param_rows = cur.fetchall()
+            
+            # Build param values map
+            param_values = {}
+            for row in param_rows:
+                pid = row["parameter_id"]
+                if row["value_text"]:
+                    param_values[pid] = row["value_text"]
+                elif row["value_integer"] is not None:
+                    param_values[pid] = str(row["value_integer"])
+                elif row["value_decimal"] is not None:
+                    param_values[pid] = str(row["value_decimal"])
+                elif row["value_date"]:
+                    param_values[pid] = row["value_date"].isoformat()
+                elif row["value_currency"]:
+                    param_values[pid] = str(row["value_currency"])
+            
+            return {
+                "clauses": clause_data,
+                "parameter_values": param_values
+            }
     
     # ------ VALIDATION HELPERS ------
     
     def verify_clause_exists(self, clause_id: str) -> bool:
         """Verify a clause_id exists in Neo4j."""
-        driver = self._get_driver()
-        try:
-            with driver.session() as session:
-                result = session.run(
-                    "MATCH (c:Clause {id: $id}) RETURN c.id",
-                    {"id": clause_id}
-                )
-                return result.single() is not None
-        finally:
-            driver.close()
+        driver = _get_shared_driver()
+        with driver.session() as session:
+            result = session.run(
+                "MATCH (c:Clause {id: $id}) RETURN c.id",
+                {"id": clause_id}
+            )
+            return result.single() is not None
     
     def verify_clause_ids_batch(self, clause_ids: List[str]) -> Dict[str, bool]:
         """Verify multiple clause_ids exist in Neo4j. Returns {id: exists}."""
-        driver = self._get_driver()
-        try:
-            with driver.session() as session:
-                result = session.run("""
-                    UNWIND $ids AS check_id
-                    OPTIONAL MATCH (c:Clause {id: check_id})
-                    RETURN check_id AS id, c IS NOT NULL AS exists
-                """, {"ids": clause_ids})
-                return {r["id"]: r["exists"] for r in result}
-        finally:
-            driver.close()
+        driver = _get_shared_driver()
+        with driver.session() as session:
+            result = session.run("""
+                UNWIND $ids AS check_id
+                OPTIONAL MATCH (c:Clause {id: check_id})
+                RETURN check_id AS id, c IS NOT NULL AS exists
+            """, {"ids": clause_ids})
+            return {r["id"]: r["exists"] for r in result}
 
 
 # ============================================================================
@@ -681,7 +656,7 @@ class GroundingValidator:
         Validate that all recommendations reference real graph data.
         Checks:
         1. All recommended clause_ids exist
-        2. Recommendations come from actual alternatives/requires data
+        2. Recommendations come from actual alternatives/requires/optional_gaps data
         """
         rec_clause_ids = [
             r.get("recommended_clause_id") 
@@ -694,9 +669,11 @@ class GroundingValidator:
             "valid": True, "invalid_ids": [], "valid_ids": []
         }
         
-        # Check that recommendations are grounded in graph context
+        # Build grounding sets from all three graph context sources
         graph_alt_ids = {a["recommended_clause_id"] for a in graph_context.get("alternatives", [])}
         graph_req_types = {r["required_clause_type"] for r in graph_context.get("requires", [])}
+        # FIX: optional_gaps are keyed by clause_type_id, not clause_id
+        graph_optional_types = {o["clause_type_id"] for o in graph_context.get("optional_gaps", [])}
         
         grounded_recs = []
         ungrounded_recs = []
@@ -705,7 +682,11 @@ class GroundingValidator:
             rec_id = rec.get("recommended_clause_id", "")
             rec_type = rec.get("clause_type", "")
             
-            if rec_id in graph_alt_ids or rec_type in graph_req_types:
+            if (
+                rec_id in graph_alt_ids
+                or rec_type in graph_req_types
+                or rec_type in graph_optional_types  # was missing before
+            ):
                 grounded_recs.append(rec)
             else:
                 ungrounded_recs.append(rec)

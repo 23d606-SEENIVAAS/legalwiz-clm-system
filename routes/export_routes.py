@@ -8,13 +8,15 @@ Endpoints:
 - GET /{contract_id}/export/docx — Download as DOCX
 """
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from fastapi.responses import StreamingResponse
 from datetime import datetime
 from io import BytesIO
 import re
+import html as html_mod
 
-from config import DB_CONFIG
+from config import get_db, DB_CONFIG, verify_contract_ownership
+from auth_middleware import get_current_user
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -23,8 +25,6 @@ router = APIRouter(prefix="/api/contracts", tags=["export"])
 
 # ==================== HELPERS ====================
 
-def get_db():
-    return psycopg2.connect(**DB_CONFIG)
 
 
 def _get_contract_data(contract_id: str) -> dict:
@@ -101,7 +101,7 @@ def _sanitize_filename(title: str) -> str:
 
 def _build_html(data: dict, watermark: str = None) -> str:
     """Build styled HTML for PDF conversion."""
-    title = data["title"]
+    title = html_mod.escape(data["title"])
     parts = []
     parts.append("<!DOCTYPE html>")
     parts.append('<html lang="en"><head><meta charset="UTF-8">')
@@ -179,7 +179,7 @@ def _build_html(data: dict, watermark: str = None) -> str:
 
     # Watermark
     if watermark:
-        parts.append(f'<div class="watermark">{watermark}</div>')
+        parts.append(f'<div class="watermark">{html_mod.escape(watermark)}</div>')
 
     # Header
     parts.append('<div class="header">')
@@ -192,13 +192,14 @@ def _build_html(data: dict, watermark: str = None) -> str:
     # Clauses
     for i, clause in enumerate(data["clauses"], 1):
         parts.append('<div class="clause">')
-        clause_name = clause["clause_type"].replace("-", " ").replace("_", " ").title()
+        clause_name = html_mod.escape(clause["clause_type"].replace("-", " ").replace("_", " ").title())
         parts.append(f'<div class="clause-title">{i}. {clause_name}</div>')
 
-        text = clause["rendered_text"]
-        # Highlight missing params
+        text = html_mod.escape(clause["rendered_text"])
+        # Highlight missing params (already escaped, safe to wrap)
         for m in clause["missing_parameters"]:
-            text = text.replace(m, f'<span class="missing-param">{m}</span>')
+            escaped_m = html_mod.escape(m)
+            text = text.replace(escaped_m, f'<span class="missing-param">{escaped_m}</span>')
         # Convert newlines to <br>
         text = text.replace("\n\n", "</p><p>").replace("\n", "<br>")
         parts.append(f'<div class="clause-text"><p>{text}</p></div>')
@@ -445,7 +446,8 @@ def _build_pdf(data: dict, watermark: str = None) -> BytesIO:
 @router.get("/{contract_id}/export/pdf")
 async def export_pdf(
     contract_id: str,
-    watermark: str = Query(None, description="Optional watermark text (e.g. 'DRAFT')")
+    watermark: str = Query(None, description="Optional watermark text (e.g. 'DRAFT')"),
+    user=Depends(get_current_user),
 ):
     """
     Export contract as a downloadable PDF file.
@@ -453,6 +455,7 @@ async def export_pdf(
     Uses fpdf2 (pure Python) to generate a professional A4 PDF
     with page numbers, proper typography, and optional watermark.
     """
+    verify_contract_ownership(contract_id, user["id"])
     data = _get_contract_data(contract_id)
 
     try:
@@ -482,13 +485,14 @@ async def export_pdf(
 
 
 @router.get("/{contract_id}/export/docx")
-async def export_docx(contract_id: str):
+async def export_docx(contract_id: str, user=Depends(get_current_user)):
     """
     Export contract as a downloadable DOCX (Word) file.
 
     Uses python-docx to create a structured Word document with
     proper headings, formatting, and signature blocks.
     """
+    verify_contract_ownership(contract_id, user["id"])
     data = _get_contract_data(contract_id)
 
     try:

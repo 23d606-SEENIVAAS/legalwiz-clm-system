@@ -1,3 +1,4 @@
+import os
 import psycopg2
 
 DDL = """
@@ -57,17 +58,26 @@ CREATE INDEX IF NOT EXISTS idx_contract_parties_role
     ON contract_parties(contract_id, party_role);
 """
 
+def _get_db_config():
+    config = {
+        "host": os.getenv("DB_HOST"),
+        "port": int(os.getenv("DB_PORT", "5432")),
+        "dbname": os.getenv("DB_NAME", "postgres"),
+        "user": os.getenv("DB_USER", "postgres"),
+        "password": os.getenv("DB_PASSWORD"),
+        "sslmode": os.getenv("DB_SSLMODE", "require"),
+    }
+    missing = [k for k, v in config.items() if v is None]
+    if missing:
+        raise EnvironmentError(
+            f"Missing required env vars: {', '.join(f'DB_{k.upper()}' for k in missing)}"
+        )
+    return config
+
 def create_schema():
     conn = None
     try:
-        conn = psycopg2.connect(
-            host="db.wjbijphzxqizbbgpbacg.supabase.co",
-            port=5432,
-            dbname="postgres",
-            user="postgres",
-            password="Sapvoyagers@1234",
-            sslmode="require"
-        )
+        conn = psycopg2.connect(**_get_db_config())
         conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute(DDL)
