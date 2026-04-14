@@ -11,13 +11,14 @@ Endpoints:
 - GET  /{id}/versions/{v1}/compare/{v2} — Diff two versions
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import json
 
-from config import DB_CONFIG
+from config import get_db, DB_CONFIG, verify_contract_ownership
+from auth_middleware import get_current_user
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -53,8 +54,6 @@ class VersionDiff(BaseModel):
 
 # ==================== HELPERS ====================
 
-def get_db():
-    return psycopg2.connect(**DB_CONFIG)
 
 
 def create_version_snapshot(
@@ -147,7 +146,7 @@ def create_version_snapshot(
 # ==================== ROUTES ====================
 
 @router.get("/{contract_id}/versions", response_model=List[VersionResponse])
-async def list_versions(contract_id: str):
+async def list_versions(contract_id: str, user=Depends(get_current_user)):
     """List all version snapshots for a contract, newest first."""
     conn = get_db()
     try:
@@ -180,7 +179,7 @@ async def list_versions(contract_id: str):
 
 
 @router.get("/{contract_id}/versions/{version_number}", response_model=VersionDetailResponse)
-async def get_version(contract_id: str, version_number: int):
+async def get_version(contract_id: str, version_number: int, user=Depends(get_current_user)):
     """Get detailed contents of a specific version."""
     conn = get_db()
     try:
@@ -209,7 +208,7 @@ async def get_version(contract_id: str, version_number: int):
 
 
 @router.post("/{contract_id}/versions", response_model=VersionResponse)
-async def create_version(contract_id: str, request: CreateVersionRequest = None):
+async def create_version(contract_id: str, request: CreateVersionRequest = None, user=Depends(get_current_user)):
     """
     Create a manual version snapshot of the contract's current state.
     Useful before making significant changes.
@@ -230,7 +229,7 @@ async def create_version(contract_id: str, request: CreateVersionRequest = None)
 
 
 @router.post("/{contract_id}/versions/{version_number}/restore")
-async def restore_version(contract_id: str, version_number: int):
+async def restore_version(contract_id: str, version_number: int, user=Depends(get_current_user)):
     """
     Restore a contract to a previous version.
 
@@ -320,7 +319,7 @@ async def restore_version(contract_id: str, version_number: int):
 
 
 @router.get("/{contract_id}/versions/{v1}/compare/{v2}", response_model=VersionDiff)
-async def compare_versions(contract_id: str, v1: int, v2: int):
+async def compare_versions(contract_id: str, v1: int, v2: int, user=Depends(get_current_user)):
     """
     Compare two versions clause-by-clause.
     Returns a list of differences (added, removed, changed clauses).

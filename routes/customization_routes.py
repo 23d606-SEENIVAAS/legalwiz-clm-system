@@ -8,15 +8,17 @@ Endpoints:
 - POST /{contract_id}/clauses/{clause_db_id}/revert-customization — revert to original
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 from graph_rag_engine import retriever, llm_client, validator
 from llm_config import SYSTEM_PROMPT_CUSTOMIZATION, CUSTOMIZATION_PROMPT
-from config import DB_CONFIG
+from config import get_db, DB_CONFIG, verify_contract_ownership
+from auth_middleware import get_current_user
 
+import logging
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -51,8 +53,6 @@ class RevertResponse(BaseModel):
 
 # ==================== HELPERS ====================
 
-def get_db():
-    return psycopg2.connect(**DB_CONFIG)
 
 
 def _format_variants(variants: List[Dict]) -> str:
@@ -84,7 +84,7 @@ def _format_parameters(params: List[Dict]) -> str:
 
 @router.post("/{contract_id}/clauses/{clause_db_id}/customize", response_model=CustomizationResult)
 async def customize_clause(
-    contract_id: str, clause_db_id: int, request: CustomizeRequest
+    contract_id: str, clause_db_id: int, request: CustomizeRequest, user=Depends(get_current_user)
 ):
     """
     Get an AI-powered customization suggestion for a clause.
@@ -145,9 +145,10 @@ async def customize_clause(
     try:
         llm_response = llm_client.generate(prompt, SYSTEM_PROMPT_CUSTOMIZATION)
     except Exception as e:
+        logging.getLogger("legalwiz").error(f"LLM generation failed for customize: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"LLM generation failed: {str(e)}"
+            detail="AI customization service temporarily unavailable. Please try again."
         )
     
     customized_text = llm_response.get("customized_text", "")
@@ -188,7 +189,7 @@ async def customize_clause(
 
 @router.post("/{contract_id}/clauses/{clause_db_id}/apply-customization")
 async def apply_customization(
-    contract_id: str, clause_db_id: int, request: ApplyCustomizationRequest
+    contract_id: str, clause_db_id: int, request: ApplyCustomizationRequest, user=Depends(get_current_user)
 ):
     """
     Apply a customization by saving the customized text to overridden_text.
@@ -229,7 +230,7 @@ async def apply_customization(
 
 
 @router.post("/{contract_id}/clauses/{clause_db_id}/revert-customization", response_model=RevertResponse)
-async def revert_customization(contract_id: str, clause_db_id: int):
+async def revert_customization(contract_id: str, clause_db_id: int, user=Depends(get_current_user)):
     """
     Revert a customized clause back to its original Neo4j text.
     Clears overridden_text and resets is_customized.

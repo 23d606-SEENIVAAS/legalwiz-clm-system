@@ -8,14 +8,15 @@ Endpoints:
 - GET  /{contract_id}/risk-analysis/quick — lightweight risk summary (no LLM)
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 from graph_rag_engine import retriever, llm_client, validator
 from llm_config import SYSTEM_PROMPT_RISK, RISK_ANALYSIS_PROMPT
-from config import DB_CONFIG
+from config import get_db, DB_CONFIG, verify_contract_ownership
+from auth_middleware import get_current_user
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -181,7 +182,7 @@ def _format_gaps(gaps: List[Dict]) -> str:
 # ==================== ROUTES ====================
 
 @router.get("/{contract_id}/risk-analysis/quick", response_model=QuickRiskResponse)
-async def get_quick_risk(contract_id: str):
+async def get_quick_risk(contract_id: str, user=Depends(get_current_user)):
     """
     Lightweight risk summary — no LLM needed.
     Pure graph computation for quick dashboard display.
@@ -230,7 +231,7 @@ async def get_quick_risk(contract_id: str):
 
 
 @router.get("/{contract_id}/risk-analysis", response_model=RiskAnalysisResponse)
-async def get_risk_analysis(contract_id: str):
+async def get_risk_analysis(contract_id: str, user=Depends(get_current_user)):
     """
     Full AI-powered risk analysis dashboard.
     

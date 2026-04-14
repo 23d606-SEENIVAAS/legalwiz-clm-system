@@ -10,7 +10,7 @@ Endpoints:
 - DELETE /{contract_id}/chat/history — clear chat history
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from datetime import datetime
@@ -18,8 +18,10 @@ import json
 
 from graph_rag_engine import retriever, llm_client, validator
 from llm_config import SYSTEM_PROMPT_CHATBOT, CHATBOT_PROMPT
-from config import DB_CONFIG
+from config import get_db, DB_CONFIG, verify_contract_ownership
+from auth_middleware import get_current_user
 
+import logging
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -58,12 +60,11 @@ class ChatHistoryResponse(BaseModel):
 
 # ==================== HELPERS ====================
 
-def get_db():
-    return psycopg2.connect(**DB_CONFIG)
+
 
 
 def _ensure_chat_table():
-    """Create chat history table if not exists."""
+    """Create chat history table if not exists. Called once at startup."""
     conn = get_db()
     try:
         with conn.cursor() as cur:
@@ -100,7 +101,7 @@ def _save_message(contract_id: str, role: str, content: str, citations: List = N
         conn.close()
 
 
-def _get_recent_history(contract_id: str, limit: int = 10) -> List[Dict]:
+def _get_recent_history(contract_id: str, limit: int = 6) -> List[Dict]:
     """Get recent chat history for context."""
     conn = get_db()
     try:
@@ -152,7 +153,7 @@ def _format_chat_history(history: List[Dict]) -> str:
         return "No previous conversation."
     
     lines = []
-    for msg in history[-6:]:  # Last 6 messages for context window
+    for msg in history:  # Already limited by _get_recent_history(limit=6)
         role = "User" if msg["role"] == "user" else "Assistant"
         content = msg["content"]
         if len(content) > 300:
@@ -165,7 +166,7 @@ def _format_chat_history(history: List[Dict]) -> str:
 # ==================== ROUTES ====================
 
 @router.post("/{contract_id}/chat", response_model=ChatResponse)
-async def chat(contract_id: str, request: ChatMessage):
+async def chat(contract_id: str, request: ChatMessage, user=Depends(get_current_user)):
     """
     Send a message to the contract chatbot.
     
@@ -176,13 +177,16 @@ async def chat(contract_id: str, request: ChatMessage):
     4. LLM answers using ONLY the provided graph context
     5. Validator checks citations reference real clauses
     """
+    # Ownership check
+    verify_contract_ownership(contract_id, user["id"])
+
     # Ensure chat table exists
-    _ensure_chat_table()
+
     
     # Get contract info
     contract = retriever.get_contract_info(contract_id)
     if not contract:
-        raise HTTPException(status_code=404, detail="Contract not found")
+        raise HTTPException(status_code=404, detail="Contract not found in graph")
     
     # Check LLM
     if not llm_client.is_configured():
@@ -204,11 +208,8 @@ async def chat(contract_id: str, request: ChatMessage):
     # --- GRAPH RETRIEVAL ---
     qa_context = retriever.get_qa_context(contract_id, active_clause_ids, request.message)
     
-    # Get chat history
+    # Get chat history (BEFORE saving user message, so LLM sees prior context only)
     history = _get_recent_history(contract_id)
-    
-    # Save user message
-    _save_message(contract_id, "user", request.message)
     
     # --- LLM GENERATION ---
     prompt = CHATBOT_PROMPT.format(
@@ -224,9 +225,10 @@ async def chat(contract_id: str, request: ChatMessage):
     try:
         llm_response = llm_client.generate(prompt, SYSTEM_PROMPT_CHATBOT)
     except Exception as e:
+        logging.getLogger("legalwiz").error(f"LLM generation failed for chat: {e}")
         raise HTTPException(
             status_code=500,
-            detail=f"LLM generation failed: {str(e)}"
+            detail="AI chatbot service temporarily unavailable. Please try again."
         )
     
     answer = llm_response.get("answer", "I'm unable to answer that question.")
@@ -239,7 +241,8 @@ async def chat(contract_id: str, request: ChatMessage):
     # Filter out invalid citations
     valid_citations = citation_check.get("valid_citations", citations)
     
-    # Save assistant response
+    # Save BOTH messages only after LLM succeeds (prevents orphaned user msgs)
+    _save_message(contract_id, "user", request.message)
     _save_message(contract_id, "assistant", answer, valid_citations)
     
     return {
@@ -256,14 +259,14 @@ async def chat(contract_id: str, request: ChatMessage):
 
 
 @router.get("/{contract_id}/chat/history", response_model=ChatHistoryResponse)
-async def get_chat_history(contract_id: str, limit: int = 50):
+async def get_chat_history(contract_id: str, limit: int = 50, user=Depends(get_current_user)):
     """Get chat history for a contract."""
-    _ensure_chat_table()
+    # Cap limit to prevent abuse
+    limit = min(max(limit, 1), 200)
+
     
-    # Verify contract exists
-    contract = retriever.get_contract_info(contract_id)
-    if not contract:
-        raise HTTPException(status_code=404, detail="Contract not found")
+    # Verify ownership
+    verify_contract_ownership(contract_id, user["id"])
     
     conn = get_db()
     try:
@@ -296,9 +299,10 @@ async def get_chat_history(contract_id: str, limit: int = 50):
 
 
 @router.delete("/{contract_id}/chat/history")
-async def clear_chat_history(contract_id: str):
+async def clear_chat_history(contract_id: str, user=Depends(get_current_user)):
     """Clear chat history for a contract."""
-    _ensure_chat_table()
+    verify_contract_ownership(contract_id, user["id"])
+
     
     conn = get_db()
     try:

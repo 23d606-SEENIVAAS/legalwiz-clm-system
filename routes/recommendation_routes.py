@@ -8,14 +8,15 @@ Endpoints:
 - POST /{contract_id}/recommendations/apply — apply a recommendation
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 from graph_rag_engine import retriever, llm_client, validator
 from llm_config import SYSTEM_PROMPT_RECOMMENDATIONS, RECOMMENDATION_PROMPT
-from config import DB_CONFIG
+from config import get_db, DB_CONFIG, verify_contract_ownership
+from auth_middleware import get_current_user
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -52,8 +53,6 @@ class ApplyRecommendationRequest(BaseModel):
 
 # ==================== HELPERS ====================
 
-def get_db():
-    return psycopg2.connect(**DB_CONFIG)
 
 
 def _format_alternatives(alternatives: List[Dict]) -> str:
@@ -108,7 +107,7 @@ def _format_optional_gaps(gaps: List[Dict]) -> str:
 # ==================== ROUTES ====================
 
 @router.get("/{contract_id}/recommendations", response_model=RecommendationResponse)
-async def get_recommendations(contract_id: str):
+async def get_recommendations(contract_id: str, user=Depends(get_current_user)):
     """
     Get AI-powered clause recommendations for a contract.
     
@@ -270,7 +269,7 @@ async def get_recommendations(contract_id: str):
 
 
 @router.post("/{contract_id}/recommendations/apply")
-async def apply_recommendation(contract_id: str, request: ApplyRecommendationRequest):
+async def apply_recommendation(contract_id: str, request: ApplyRecommendationRequest, user=Depends(get_current_user)):
     """
     Apply a recommendation: switch variant or add a clause.
     """
@@ -358,15 +357,26 @@ async def apply_recommendation(contract_id: str, request: ApplyRecommendationReq
                     detail=f"Unknown recommendation type: {request.recommendation_type}"
                 )
     
-            # Auto-version: snapshot after recommendation applied
-            try:
-                from version_routes import create_version_snapshot
-                create_version_snapshot(
-                    contract_id,
-                    f"Applied recommendation: {request.recommendation_type} for {request.clause_type}"
-                )
-            except Exception:
-                pass  # Don't fail the main operation if versioning fails
-
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions as-is
+    except Exception as e:
+        import logging
+        logging.getLogger("legalwiz").error(
+            f"apply_recommendation failed for contract {contract_id}: {e}", exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to apply recommendation. Please try again."
+        )
     finally:
+        # Auto-version: best-effort snapshot after recommendation applied
+        try:
+            from version_routes import create_version_snapshot
+            create_version_snapshot(
+                contract_id,
+                f"Applied recommendation: {request.recommendation_type} for {request.clause_type}"
+            )
+        except Exception:
+            pass  # Don't fail the main operation if versioning fails
+
         conn.close()

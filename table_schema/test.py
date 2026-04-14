@@ -1,7 +1,9 @@
+import os
 import psycopg2
 
 DDL = """
--- 1) ENUMs (your 7 contract types)
+-- Full reset: DROP and recreate with corrected 7 contract types
+-- WARNING: This drops and recreates contracts table. Use only in dev/initial setup.
 DROP TYPE IF EXISTS contract_type_enum CASCADE;
 DROP TYPE IF EXISTS contract_status_enum CASCADE;
 DROP TYPE IF EXISTS jurisdiction_enum CASCADE;
@@ -22,7 +24,7 @@ CREATE TYPE contract_status_enum AS ENUM (
 
 CREATE TYPE jurisdiction_enum AS ENUM ('India', 'USA', 'UK');
 
--- 2) CONTRACTS TABLE (NO AUTH FK)
+-- CONTRACTS TABLE (no auth.users FK for standalone deployment)
 DROP TABLE IF EXISTS contracts CASCADE;
 
 CREATE TABLE contracts (
@@ -31,46 +33,48 @@ CREATE TABLE contracts (
     contract_type   contract_type_enum NOT NULL,
     jurisdiction    jurisdiction_enum NOT NULL DEFAULT 'India'::jurisdiction_enum,
     status          contract_status_enum NOT NULL DEFAULT 'draft'::contract_status_enum,
-    
-    -- No FK - just UUID
     created_by      UUID NOT NULL,
-    
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     description     TEXT CHECK (description IS NULL OR LENGTH(description) <= 2000),
     tags            TEXT[]
 );
 
--- 3) Indexes
 CREATE INDEX idx_contracts_created_by ON contracts(created_by);
 CREATE INDEX idx_contracts_status ON contracts(status);
 CREATE INDEX idx_contracts_type ON contracts(contract_type);
 CREATE INDEX idx_contracts_created_at ON contracts(created_at DESC);
 
--- 4) No RLS (open for dev)
--- ALTER TABLE contracts ENABLE ROW LEVEL SECURITY; -- commented out
-
-SELECT '✅ Contracts table created WITHOUT auth dependency!' as status;
+SELECT '✅ Contracts table recreated with 7 correct contract types!' as status;
 """
+
+def _get_db_config():
+    config = {
+        "host": os.getenv("DB_HOST"),
+        "port": int(os.getenv("DB_PORT", "5432")),
+        "dbname": os.getenv("DB_NAME", "postgres"),
+        "user": os.getenv("DB_USER", "postgres"),
+        "password": os.getenv("DB_PASSWORD"),
+        "sslmode": os.getenv("DB_SSLMODE", "require"),
+    }
+    missing = [k for k, v in config.items() if v is None]
+    if missing:
+        raise EnvironmentError(
+            f"Missing required env vars: {', '.join(f'DB_{k.upper()}' for k in missing)}"
+        )
+    return config
 
 def create_schema():
     conn = None
     try:
-        conn = psycopg2.connect(
-            host="db.wjbijphzxqizbbgpbacg.supabase.co",
-            port=5432,
-            dbname="postgres",
-            user="postgres",
-            password="Sapvoyagers@1234",
-            sslmode="require"
-        )
+        conn = psycopg2.connect(**_get_db_config())
         conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute(DDL)
-        print("✅ contracts table created WITHOUT auth FK!")
-        print("   🎯 7 contract types ready")
+        print("✅ contracts table reset with 7 correct types!")
+        print("   🎯 Matches API: employment_nda, saas_service_agreement, etc.")
         print("   🔓 No auth.users dependency")
-        print("   🚀 Ready for API testing")
+        print("   ⚠️  All dependent tables were CASCADE dropped — re-run other migrations")
     except Exception as e:
         print("❌ Error:", e)
     finally:
@@ -78,4 +82,9 @@ def create_schema():
             conn.close()
 
 if __name__ == "__main__":
-    create_schema()
+    print("⚠️  WARNING: This will DROP and recreate the contracts table and all dependents!")
+    confirm = input("Type 'yes' to confirm: ")
+    if confirm.strip().lower() == "yes":
+        create_schema()
+    else:
+        print("Aborted.")
