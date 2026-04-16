@@ -5,17 +5,7 @@ from typing import List, Optional
 from enum import Enum
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from config import DB_CONFIG, NEO4J_CONFIG
-
-# Database config (same as main.py)
-# DB_CONFIG = {
-#     "host": "db.wjbijphzxqizbbgpbacg.supabase.co",
-#     "port": 5432,
-#     "dbname": "postgres",
-#     "user": "postgres",
-#     "password": "Sapvoyagers@1234",
-#     "sslmode": "require"
-# }
+from config import get_db, DB_CONFIG, NEO4J_CONFIG
 
 router = APIRouter(prefix="/api/contracts", tags=["parties"])
 
@@ -70,8 +60,6 @@ class PartyResponse(BaseModel):
     email: Optional[str]
     phone: Optional[str]
 
-def get_db():
-    return psycopg2.connect(**DB_CONFIG)
 
 # ROUTES
 @router.post("/{contract_id}/parties", response_model=PartyResponse, status_code=201)
@@ -174,12 +162,24 @@ async def update_party(contract_id: str, party_id: int, request: UpdateParty):
             if request.address_line1 is not None:
                 updates.append("address_line1 = %s")
                 params.append(request.address_line1)
+            if request.address_line2 is not None:
+                updates.append("address_line2 = %s")
+                params.append(request.address_line2)
             if request.city is not None:
                 updates.append("city = %s")
                 params.append(request.city)
             if request.state is not None:
                 updates.append("state = %s")
                 params.append(request.state)
+            if request.postal_code is not None:
+                updates.append("postal_code = %s")
+                params.append(request.postal_code)
+            if request.country is not None:
+                updates.append("country = %s")
+                params.append(request.country)
+            if request.contact_person is not None:
+                updates.append("contact_person = %s")
+                params.append(request.contact_person)
             if request.email is not None:
                 updates.append("email = %s")
                 params.append(request.email)

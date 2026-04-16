@@ -1,36 +1,30 @@
-# fix_parameter_fk.py - Remove FK constraint from contract_parameters
+import os
 import psycopg2
 
-DB_CONFIG = {
-    "host": "db.wjbijphzxqizbbgpbacg.supabase.co",
-    "port": 5432,
-    "dbname": "postgres",
-    "user": "postgres",
-    "password": "Sapvoyagers@1234",
-    "sslmode": "require"
-}
-
-DDL = """
--- Step 1: Remove the foreign key constraint
-ALTER TABLE contract_parameters
-DROP CONSTRAINT IF EXISTS contract_parameters_parameter_id_fkey;
-
--- Step 2: Verify it's removed
-SELECT 
-    conname AS constraint_name,
-    contype AS constraint_type
-FROM pg_constraint
-WHERE conrelid = 'contract_parameters'::regclass;
-"""
+def _get_db_config():
+    config = {
+        "host": os.getenv("DB_HOST"),
+        "port": int(os.getenv("DB_PORT", "5432")),
+        "dbname": os.getenv("DB_NAME", "postgres"),
+        "user": os.getenv("DB_USER", "postgres"),
+        "password": os.getenv("DB_PASSWORD"),
+        "sslmode": os.getenv("DB_SSLMODE", "require"),
+    }
+    missing = [k for k, v in config.items() if v is None]
+    if missing:
+        raise EnvironmentError(
+            f"Missing required env vars: {', '.join(f'DB_{k.upper()}' for k in missing)}"
+        )
+    return config
 
 def fix_foreign_key():
     conn = None
     try:
-        conn = psycopg2.connect(**DB_CONFIG)
+        conn = psycopg2.connect(**_get_db_config())
         conn.autocommit = True
         
         with conn.cursor() as cur:
-            # Remove FK constraint
+            # Remove FK constraint (Neo4j is now the source of truth for parameter definitions)
             cur.execute("""
                 ALTER TABLE contract_parameters
                 DROP CONSTRAINT IF EXISTS contract_parameters_parameter_id_fkey;

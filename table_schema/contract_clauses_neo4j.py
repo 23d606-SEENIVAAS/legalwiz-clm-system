@@ -1,3 +1,4 @@
+import os
 import psycopg2
 
 DDL = """
@@ -22,21 +23,22 @@ CREATE TABLE IF NOT EXISTS contract_clauses (
     sequence        INTEGER NOT NULL,        -- Display order: 1, 2, 3...
     is_mandatory    BOOLEAN NOT NULL DEFAULT false,
     is_customized   BOOLEAN NOT NULL DEFAULT false,
+    is_active       BOOLEAN NOT NULL DEFAULT true,
     
     -- User overrides (optional)
     overridden_text TEXT,                    -- Custom clause text if modified
     
     -- Parameter binding status
-    parameters_bound JSONB DEFAULT '{}',     -- {{"{{PARTY_A}}": "bound"}}
+    parameters_bound JSONB DEFAULT '{}',     -- {"{{PARTY_A}}": "bound"}
     
     -- Timestamps
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 3) Unique constraint: no duplicate clauses per contract
+-- 3) Unique constraint: no duplicate clause_ids per contract
 ALTER TABLE contract_clauses 
-ADD CONSTRAINT unique_clause_per_contract 
+ADD CONSTRAINT IF NOT EXISTS unique_clause_id_per_contract 
 UNIQUE (contract_id, clause_id);
 
 -- 4) Indexes for performance
@@ -48,19 +50,35 @@ CREATE INDEX IF NOT EXISTS idx_contract_clauses_sequence
 
 CREATE INDEX IF NOT EXISTS idx_contract_clauses_clause_id 
     ON contract_clauses(clause_id);
+
+CREATE INDEX IF NOT EXISTS idx_contract_clauses_active 
+    ON contract_clauses(contract_id, is_active) 
+    WHERE is_active = true;
+
+CREATE INDEX IF NOT EXISTS idx_contract_clauses_type_variant
+    ON contract_clauses(contract_id, clause_type, variant);
 """
+
+def _get_db_config():
+    config = {
+        "host": os.getenv("DB_HOST"),
+        "port": int(os.getenv("DB_PORT", "5432")),
+        "dbname": os.getenv("DB_NAME", "postgres"),
+        "user": os.getenv("DB_USER", "postgres"),
+        "password": os.getenv("DB_PASSWORD"),
+        "sslmode": os.getenv("DB_SSLMODE", "require"),
+    }
+    missing = [k for k, v in config.items() if v is None]
+    if missing:
+        raise EnvironmentError(
+            f"Missing required env vars: {', '.join(f'DB_{k.upper()}' for k in missing)}"
+        )
+    return config
 
 def create_schema():
     conn = None
     try:
-        conn = psycopg2.connect(
-            host="db.wjbijphzxqizbbgpbacg.supabase.co",
-            port=5432,
-            dbname="postgres",
-            user="postgres",
-            password="Sapvoyagers@1234",
-            sslmode="require"
-        )
+        conn = psycopg2.connect(**_get_db_config())
         conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute(DDL)
@@ -69,6 +87,7 @@ def create_schema():
         print("   📋 Neo4j clause_id storage")
         print("   🔢 sequence ordering")
         print("   ✅ UNIQUE(contract_id, clause_id)")
+        print("   ✅ is_active column included")
     except Exception as e:
         print("❌ Error:", e)
     finally:

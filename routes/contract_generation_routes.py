@@ -1,5 +1,6 @@
 # contract_generation_routes.py - Step 5: Contract Generation
-from fastapi import APIRouter, HTTPException
+import html as html_mod
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from datetime import datetime
@@ -7,24 +8,8 @@ from neo4j import GraphDatabase
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import re
-from config import DB_CONFIG, NEO4J_CONFIG
-
-# # Database configs
-# DB_CONFIG = {
-#     "host": "db.wjbijphzxqizbbgpbacg.supabase.co",
-#     "port": 5432,
-#     "dbname": "postgres",
-#     "user": "postgres",
-#     "password": "Sapvoyagers@1234",
-#     "sslmode": "require"
-# }
-
-# NEO4J_CONFIG = {
-#     "uri": "neo4j+s://3c5b6f0d.databases.neo4j.io",
-#     "username": "neo4j",
-#     "password": "CgG5iYCxef1ExRTXTenDiO6wtXzQPgiDECdWDdmJi38",
-#     "database": "neo4j"
-# }
+from config import DB_CONFIG, NEO4J_CONFIG, get_db, verify_contract_ownership
+from auth_middleware import get_current_user
 
 router = APIRouter(prefix="/api/contracts", tags=["contract-generation"])
 
@@ -55,16 +40,7 @@ class GeneratedContract(BaseModel):
     missing_parameters: List[str] = []
 
 # ==================== DATABASE HELPERS ====================
-
-def get_db():
-    return psycopg2.connect(**DB_CONFIG)
-
-def get_neo4j_driver():
-    return GraphDatabase.driver(
-        NEO4J_CONFIG["uri"],
-        auth=(NEO4J_CONFIG["username"], NEO4J_CONFIG["password"]),
-        database=NEO4J_CONFIG["database"]
-    )
+from config import get_connection, get_neo4j_driver
 
 # ==================== CONTRACT GENERATION ====================
 
@@ -274,7 +250,7 @@ def format_contract_text(clauses: List[Dict], contract_title: str, contract_type
 # ==================== ROUTES ====================
 
 @router.post("/{contract_id}/generate", response_model=GeneratedContract)
-async def generate_contract(contract_id: str):
+async def generate_contract(contract_id: str, user=Depends(get_current_user)):
     """
     Step 5.1: Generate complete contract with all parameters replaced
     
@@ -285,6 +261,8 @@ async def generate_contract(contract_id: str):
     4. Replace placeholders
     5. Format as complete document
     """
+    verify_contract_ownership(contract_id, user["id"])
+
     # Verify contract exists
     conn = get_db()
     try:
@@ -364,23 +342,23 @@ async def generate_contract(contract_id: str):
 
 
 @router.get("/{contract_id}/preview", response_model=GeneratedContract)
-async def preview_contract(contract_id: str):
+async def preview_contract(contract_id: str, user=Depends(get_current_user)):
     """
     Step 5.2: Preview contract (same as generate but GET request)
     
     Shows current state with placeholders for missing parameters
     """
-    return await generate_contract(contract_id)
+    return await generate_contract(contract_id, user)
 
 
 @router.get("/{contract_id}/preview/html")
-async def preview_contract_html(contract_id: str):
+async def preview_contract_html(contract_id: str, user=Depends(get_current_user)):
     """
     Step 5.3: Get HTML preview of contract
     
     Returns HTML formatted contract for web display
     """
-    generated = await generate_contract(contract_id)
+    generated = await generate_contract(contract_id, user)
     
     # Convert to HTML
     html_parts = []
@@ -388,7 +366,7 @@ async def preview_contract_html(contract_id: str):
     html_parts.append('<html lang="en">')
     html_parts.append('<head>')
     html_parts.append('<meta charset="UTF-8">')
-    html_parts.append(f'<title>{generated["contract_title"]}</title>')
+    html_parts.append(f'<title>{html_mod.escape(generated["contract_title"])}</title>')
     html_parts.append('<style>')
     html_parts.append('''
         body { font-family: 'Times New Roman', serif; max-width: 800px; margin: 40px auto; padding: 20px; line-height: 1.6; }
@@ -407,8 +385,8 @@ async def preview_contract_html(contract_id: str):
     
     # Header
     html_parts.append('<div class="header">')
-    html_parts.append(f'<div class="title">{generated["contract_title"]}</div>')
-    html_parts.append(f'<div class="meta">Type: {generated["contract_type"]} | Jurisdiction: {generated["jurisdiction"]}</div>')
+    html_parts.append(f'<div class="title">{html_mod.escape(generated["contract_title"])}</div>')
+    html_parts.append(f'<div class="meta">Type: {html_mod.escape(generated["contract_type"])} | Jurisdiction: {html_mod.escape(generated["jurisdiction"])}</div>')
     html_parts.append(f'<div class="meta">Generated: {generated["generated_at"].strftime("%B %d, %Y at %I:%M %p")}</div>')
     html_parts.append('</div>')
     
@@ -418,9 +396,10 @@ async def preview_contract_html(contract_id: str):
         html_parts.append(f'<div class="clause-title">{i}. {clause["clause_type"].upper().replace("_", " ")}</div>')
         
         # Highlight missing parameters
-        text = clause["rendered_text"]
+        text = html_mod.escape(clause["rendered_text"])
         for missing in clause["missing_parameters"]:
-            text = text.replace(missing, f'<span class="missing-param">{missing}</span>')
+            escaped_m = html_mod.escape(missing)
+            text = text.replace(escaped_m, f'<span class="missing-param">{escaped_m}</span>')
         
         html_parts.append(f'<div class="clause-text">{text}</div>')
         html_parts.append('</div>')
@@ -439,7 +418,7 @@ async def preview_contract_html(contract_id: str):
 
 
 @router.get("/{contract_id}/status")
-async def get_contract_status(contract_id: str):
+async def get_contract_status(contract_id: str, user=Depends(get_current_user)):
     """
     Step 5.4: Get contract generation status
     
@@ -471,8 +450,19 @@ async def get_contract_status(contract_id: str):
     finally:
         conn.close()
     
-    # Check if ready
+    # is_ready requires clauses AND that all required parameters are filled
+    # (param_count > 0 alone is a false positive if only 1 of N is set)
     is_ready = clause_count > 0 and param_count > 0
+    if is_ready:
+        # Double-check by generating and seeing if any params are missing
+        try:
+            param_values = get_parameter_values(contract_id)
+            param_names = get_parameter_names_map(contract_id)
+            total_required = len(param_names)
+            filled = sum(1 for pid in param_names if pid in param_values)
+            is_ready = filled >= total_required and total_required > 0
+        except Exception:
+            is_ready = False
     
     return {
         "contract_id": contract_id,

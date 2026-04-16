@@ -1,3 +1,4 @@
+import os
 import psycopg2
 
 DDL = """
@@ -62,43 +63,47 @@ CREATE TABLE IF NOT EXISTS parameter_definitions (
     description          TEXT,
     example_value        TEXT,
     validation_rule      TEXT,                  -- e.g. 'positive_integer', 'email', 'date_yyyy_mm_dd'
-    input_format         TEXT,                  -- e.g. 'text', 'textarea', 'select', 'date', 'number',
+    input_format         TEXT,                  -- e.g. 'text', 'textarea', 'select', 'date', 'number'
     
     -- Link to clauses (Neo4j ids) where this parameter is used
-    -- Example: ['CONF_STD_001', 'CONF_MOD_001']
     used_in_clauses      TEXT[] NOT NULL DEFAULT '{}',
     
-    -- Optional: allow quick search by name/category
     created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- 3) Indexes for faster lookups
--- Find all parameters used by a given clause_id
 CREATE INDEX IF NOT EXISTS idx_param_defs_used_in_clauses
     ON parameter_definitions
     USING GIN (used_in_clauses);
 
--- Search by category (e.g. show all Core parameters)
 CREATE INDEX IF NOT EXISTS idx_param_defs_category
     ON parameter_definitions(category);
 
--- Search by data_type (for UI rendering)
 CREATE INDEX IF NOT EXISTS idx_param_defs_data_type
     ON parameter_definitions(data_type);
 """
 
+def _get_db_config():
+    config = {
+        "host": os.getenv("DB_HOST"),
+        "port": int(os.getenv("DB_PORT", "5432")),
+        "dbname": os.getenv("DB_NAME", "postgres"),
+        "user": os.getenv("DB_USER", "postgres"),
+        "password": os.getenv("DB_PASSWORD"),
+        "sslmode": os.getenv("DB_SSLMODE", "require"),
+    }
+    missing = [k for k, v in config.items() if v is None]
+    if missing:
+        raise EnvironmentError(
+            f"Missing required env vars: {', '.join(f'DB_{k.upper()}' for k in missing)}"
+        )
+    return config
+
 def create_schema():
     conn = None
     try:
-        conn = psycopg2.connect(
-            host="db.wjbijphzxqizbbgpbacg.supabase.co",
-            port=5432,
-            dbname="postgres",
-            user="postgres",
-            password="Sapvoyagers@1234",
-            sslmode="require"
-        )
+        conn = psycopg2.connect(**_get_db_config())
         conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute(DDL)

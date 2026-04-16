@@ -2,46 +2,124 @@
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from enum import Enum
-import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import datetime
 import uuid
 from contextlib import asynccontextmanager
-from config import DB_CONFIG, NEO4J_CONFIG
+from config import DB_CONFIG, NEO4J_CONFIG, get_connection, close_connections
 
 from party_routes import router as party_routes
 from neo4j_routes import router as neo4j_routes
 from parameters_routes import router as parameters_router
 from contract_generation_routes import router as generation_router
 
-app = FastAPI(title="LegalWiz CLM API", version="1.0.0")
+# AI Feature Routes (Graph RAG)
+from recommendation_routes import router as recommendation_router
+from customization_routes import router as customization_router
+from risk_routes import router as risk_router
+from chatbot_routes import router as chatbot_router
 
-# CORS for React frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Update for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# Export & Utility Routes
+from export_routes import router as export_router
+from template_routes import router as template_router
+from version_routes import router as version_router
+from esign_routes import router as esign_router
+
+# Auth
+from auth_routes import router as auth_router
+from auth_middleware import get_current_user
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: create all required tables/columns once (not per-worker)
+    import logging
+    logger = logging.getLogger("legalwiz.startup")
+    logger.info("Running startup table creation...")
+    try:
+        from auth_routes import _ensure_table as ensure_users_table
+        ensure_users_table()
+    except Exception as e:
+        logger.warning(f"Users table setup: {e}")
+    try:
+        from chatbot_routes import _ensure_chat_table as ensure_chat_table
+        ensure_chat_table()
+    except Exception as e:
+        logger.warning(f"Chat table setup: {e}")
+    try:
+        from template_routes import _ensure_table as ensure_template_table
+        ensure_template_table()
+    except Exception as e:
+        logger.warning(f"Template table setup: {e}")
+    try:
+        from esign_routes import _ensure_columns as ensure_esign_columns
+        ensure_esign_columns()
+    except Exception as e:
+        logger.warning(f"E-sign columns setup: {e}")
+    logger.info("Startup table creation complete.")
+    yield
+    # Shutdown: cleanly close Neo4j singleton driver + Postgres pool
+    try:
+        from graph_rag_engine import close_driver
+        close_driver()
+    except Exception:
+        pass
+    close_connections()
+
+app = FastAPI(
+    title="LegalWiz CLM API",
+    version="3.0.0",
+    description="Contract Lifecycle Management with Graph RAG AI",
+    lifespan=lifespan,
 )
 
+# CORS — restrict to known frontend origins
+# Add your production domain(s) here when deploying
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+]
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+)
+
+# Security Middleware (rate limiting + request ID)
+from middleware import setup_middleware
+setup_middleware(app)
+
+# Global Error Handlers
+from error_handlers import register_error_handlers
+register_error_handlers(app)
+
+# Core Routes
 app.include_router(party_routes)
 app.include_router(neo4j_routes)
 app.include_router(parameters_router)
 app.include_router(generation_router)
 
-# Supabase connection pool
-# DB_CONFIG = {
-#     "host": "db.wjbijphzxqizbbgpbacg.supabase.co",
-#     "port": 5432,
-#     "dbname": "postgres",
-#     "user": "postgres", 
-#     "password": "Sapvoyagers@1234",
-#     "sslmode": "require"
-# }
+# AI Feature Routes (Graph RAG)
+app.include_router(recommendation_router)
+app.include_router(customization_router)
+app.include_router(risk_router)
+app.include_router(chatbot_router)
+
+# Export & Utility Routes
+app.include_router(export_router)
+app.include_router(template_router)
+app.include_router(version_router)
+app.include_router(esign_router)
+
+# Auth
+app.include_router(auth_router)
+
 
 # Pydantic Models (matches your contracts table)
 class ContractType(str, Enum):
@@ -91,22 +169,30 @@ class ContractResponse(BaseModel):
     description: Optional[str] = None
     tags: Optional[List[str]] = None
 
-# Database helper
-def get_db():
-    conn = psycopg2.connect(**DB_CONFIG)
-    return conn
+# (No get_db() needed — use `get_connection()` from config directly)
 
-# Dependency to get current user (from JWT - placeholder)
-def get_current_user() -> str:
-    """Mock user - returns same UUID every time"""
-    return "11111111-1111-1111-1111-111111111111"    # Mock UUID for now
+
+# ==================== OWNERSHIP HELPER ====================
+
+def verify_contract_ownership(contract_id: str, user_id: str, cur) -> Dict:
+    """
+    Verify the current user owns a contract. Returns the contract row.
+    Raises 404 if not found or not owned by user.
+    """
+    cur.execute("""
+        SELECT * FROM contracts WHERE id = %s AND created_by = %s
+    """, (contract_id, user_id))
+    result = cur.fetchone()
+    if not result:
+        raise HTTPException(status_code=404, detail="Contract not found")
+    return result
+
 
 # ROUTES FOR CONTRACTS (MAIN TABLE)
 @app.post("/api/contracts", response_model=ContractResponse, status_code=201)
-async def create_contract(request: CreateContract):
+async def create_contract(request: CreateContract, user=Depends(get_current_user)):
     """Create new contract"""
-    conn = get_db()
-    try:
+    with get_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
                 INSERT INTO contracts (
@@ -119,44 +205,32 @@ async def create_contract(request: CreateContract):
                 request.jurisdiction,
                 request.description,
                 request.tags,
-                get_current_user()
+                user["id"]
             ))
             result = cur.fetchone()
             conn.commit()
             return result
-    finally:
-        conn.close()
 
 @app.get("/api/contracts/{contract_id}", response_model=ContractResponse)
-async def get_contract(contract_id: str):
-    """Get single contract"""
-    conn = get_db()
-    try:
+async def get_contract(contract_id: str, user=Depends(get_current_user)):
+    """Get single contract (must be owned by current user)"""
+    with get_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT * FROM contracts WHERE id = %s
-            """, (contract_id,))
-            result = cur.fetchone()
-            if not result:
-                raise HTTPException(status_code=404, detail="Contract not found")
-            return result
-    finally:
-        conn.close()
+            return verify_contract_ownership(contract_id, user["id"], cur)
 
 @app.get("/api/contracts", response_model=List[ContractResponse])
 async def list_contracts(
     limit: int = 50,
     offset: int = 0,
     contract_type: Optional[ContractType] = None,
-    status: Optional[ContractStatus] = None
+    status: Optional[ContractStatus] = None,
+    user=Depends(get_current_user),
 ):
-    """List contracts with filters"""
-    conn = get_db()
-    try:
+    """List contracts with filters (scoped to current user)"""
+    with get_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # DEVELOPMENT MODE: Remove created_by filter
-            query = "SELECT * FROM contracts WHERE 1=1"
-            params = []
+            query = "SELECT * FROM contracts WHERE created_by = %s"
+            params = [user["id"]]
             
             if contract_type:
                 query += " AND contract_type = %s"
@@ -171,15 +245,12 @@ async def list_contracts(
             
             cur.execute(query, params)
             return cur.fetchall()
-    finally:
-        conn.close()
 
 
 @app.put("/api/contracts/{contract_id}", response_model=ContractResponse)
-async def update_contract(contract_id: str, request: UpdateContract):
-    """Update contract"""
-    conn = get_db()
-    try:
+async def update_contract(contract_id: str, request: UpdateContract, user=Depends(get_current_user)):
+    """Update contract (must be owned by current user)"""
+    with get_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             updates = []
             params = []
@@ -203,13 +274,12 @@ async def update_contract(contract_id: str, request: UpdateContract):
             if not updates:
                 raise HTTPException(status_code=400, detail="No fields to update")
             
-            # DEVELOPMENT MODE: Remove created_by check
-            params.append(contract_id)
+            params.extend([user["id"], contract_id])
             
             cur.execute(f"""
                 UPDATE contracts 
                 SET {', '.join(updates)}, updated_at = NOW()
-                WHERE id = %s
+                WHERE created_by = %s AND id = %s
                 RETURNING *
             """, params)
             
@@ -219,35 +289,45 @@ async def update_contract(contract_id: str, request: UpdateContract):
             
             conn.commit()
             return result
-    finally:
-        conn.close()
 
-
-    #params.extend([get_current_user(), contract_id])
 
 @app.delete("/api/contracts/{contract_id}")
-async def delete_contract(contract_id: str):
-    """Delete draft contract"""
-    conn = get_db()
-    try:
+async def delete_contract(contract_id: str, user=Depends(get_current_user)):
+    """Delete draft contract (must be owned by current user)"""
+    with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 DELETE FROM contracts 
                 WHERE id = %s AND created_by = %s AND status = 'draft'
-            """, (contract_id, get_current_user()))
+            """, (contract_id, user["id"]))
             
             if cur.rowcount == 0:
                 raise HTTPException(status_code=404, detail="Contract not found or cannot delete")
             
             conn.commit()
             return {"message": "Contract deleted successfully"}
-    finally:
-        conn.close()
 
 # Health check
 @app.get("/api/health")
 async def health():
-    return {"status": "healthy", "tables": "contracts ready"}
+    from llm_config import LLM_CONFIG as llm_cfg
+    llm_ready = bool(llm_cfg.get("api_key"))
+    return {
+        "status": "healthy",
+        "version": "3.0.0",
+        "tables": "contracts ready",
+        "ai_features": {
+            "llm_configured": llm_ready,
+            "llm_provider": llm_cfg.get("provider", "none"),
+            "llm_model": llm_cfg.get("model", "none") if llm_ready else "not configured",
+            "endpoints": {
+                "recommendations": "/api/contracts/{id}/recommendations",
+                "customization": "/api/contracts/{id}/clauses/{clause_id}/customize",
+                "risk_analysis": "/api/contracts/{id}/risk-analysis",
+                "chatbot": "/api/contracts/{id}/chat"
+            }
+        }
+    }
 
 if __name__ == "__main__":
     import uvicorn

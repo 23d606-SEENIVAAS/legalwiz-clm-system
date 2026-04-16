@@ -9,23 +9,6 @@ import json
 from datetime import datetime
 from config import DB_CONFIG, NEO4J_CONFIG
 
-# Database configs
-# DB_CONFIG = {
-#     "host": "db.wjbijphzxqizbbgpbacg.supabase.co",
-#     "port": 5432,
-#     "dbname": "postgres",
-#     "user": "postgres",
-#     "password": "Sapvoyagers@1234",
-#     "sslmode": "require"
-# }
-
-# NEO4J_CONFIG = {
-#     "uri": "neo4j+s://3c5b6f0d.databases.neo4j.io",
-#     "username": "neo4j",
-#     "password": "CgG5iYCxef1ExRTXTenDiO6wtXzQPgiDECdWDdmJi38",
-#     "database": "neo4j"
-# }
-
 router = APIRouter(prefix="/api/contracts", tags=["clauses"])
 
 # ==================== PYDANTIC MODELS ====================
@@ -62,16 +45,14 @@ class SwitchVariantRequest(BaseModel):
     new_variant: str
 
 # ==================== DATABASE HELPERS ====================
+# Both helpers delegate to the shared singletons in config.py
+from config import get_connection, get_neo4j_driver
 
 def get_db():
+    """Legacy shim — callers should migrate to get_connection() context manager."""
+    import psycopg2
+    from config import DB_CONFIG
     return psycopg2.connect(**DB_CONFIG)
-
-def get_neo4j_driver():
-    return GraphDatabase.driver(
-        NEO4J_CONFIG["uri"],
-        auth=(NEO4J_CONFIG["username"], NEO4J_CONFIG["password"]),
-        database=NEO4J_CONFIG["database"]
-    )
 
 # ==================== NEO4J QUERIES ====================
 
@@ -96,27 +77,24 @@ def fetch_clauses_from_neo4j(contract_type: str, jurisdiction: str):
     ORDER BY rel.sequence, c.variant
     """
     
-    try:
-        with driver.session() as session:
-            result = session.run(cypher_query, {
-                "contract_type": neo4j_ct_id,
-                "jurisdiction": jurisdiction
+    with driver.session() as session:
+        result = session.run(cypher_query, {
+            "contract_type": neo4j_ct_id,
+            "jurisdiction": jurisdiction
+        })
+        
+        clauses = []
+        for record in result:
+            clauses.append({
+                "clause_id": record["clause_id"],
+                "clause_type": record["clause_type"],
+                "variant": record["variant"],
+                "raw_text": record["raw_text"],
+                "sequence": int(record["sequence"]),
+                "is_mandatory": bool(record["is_mandatory"]),
+                "clause_description": record["clause_description"]
             })
-            
-            clauses = []
-            for record in result:
-                clauses.append({
-                    "clause_id": record["clause_id"],
-                    "clause_type": record["clause_type"],
-                    "variant": record["variant"],
-                    "raw_text": record["raw_text"],
-                    "sequence": int(record["sequence"]),
-                    "is_mandatory": bool(record["is_mandatory"]),
-                    "clause_description": record["clause_description"]
-                })
-            return clauses
-    finally:
-        driver.close()
+        return clauses
 
 # ==================== ROUTES ====================
 
@@ -296,7 +274,6 @@ async def get_active_clauses(contract_id: str):
     
     finally:
         conn.close()
-        driver.close()
 
 
 
@@ -372,6 +349,17 @@ async def switch_clause_variant(contract_id: str, request: SwitchVariantRequest)
                 )
             
             conn.commit()
+            
+            # Auto-version: snapshot after variant switch
+            try:
+                from version_routes import create_version_snapshot
+                create_version_snapshot(
+                    contract_id,
+                    f"Switched {request.clause_type} to {request.new_variant} variant"
+                )
+            except Exception:
+                pass  # Don't fail the main operation if versioning fails
+            
             return result
     
     except HTTPException:
