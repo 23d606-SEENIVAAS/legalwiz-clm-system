@@ -8,6 +8,7 @@ on:
   push:
     branches:
       - adarsh
+      - main
   workflow_dispatch:
 
 jobs:
